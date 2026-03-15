@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -14,19 +16,36 @@ type Result struct {
 	Title string `json:"title"`
 }
 
-func fetchURL(url string, wg *sync.WaitGroup, ch chan<- Result) {
+func fetchURL(url string, wg *sync.WaitGroup, ch chan<- Result, sem chan struct{}) {
 
 	defer wg.Done()
-	resp, err := http.Get(url)
+
+	sem <- struct{}{}        // Acquire semaphore
+	defer func() { <-sem }() // Release semaphore
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+
 	if err != nil {
 		log.Printf("Error fetching the resp, err: %s", err)
+		return
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("Error fetching the URL: %v", err)
+		return // MUST return here so you don't use a nil 'resp'
 	}
 
 	defer resp.Body.Close()
+
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 
 	if err != nil {
 		log.Printf("Error fetching the doc; err: %s", err)
+		return
 	}
 
 	title := doc.Find("title").Text()
@@ -41,10 +60,11 @@ func main() {
 	var wg sync.WaitGroup
 
 	ch := make(chan Result, len(urls))
+	sem := make(chan struct{}, 5) // Limit to 5 concurrent fetches
 
 	for _, url := range urls {
 		wg.Add(1)
-		go fetchURL(url, &wg, ch)
+		go fetchURL(url, &wg, ch, sem)
 	}
 
 	wg.Wait()
