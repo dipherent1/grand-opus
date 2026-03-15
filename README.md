@@ -1,7 +1,7 @@
 
 
-- [] scrape a few sites 
-- [] use go routines and sophmore to speed up the scraping process
+- [x] scrape a few sites 
+- [x] use go routines and sophmore to speed up the scraping process
 - [] set up a database and store the scraped data
 
 - [] set up logging and monitoring for the scraper
