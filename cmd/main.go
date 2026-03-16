@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/dipherent1/grand-opus/config"
+	"github.com/dipherent1/grand-opus/pkg"
 )
 
 type Result struct {
@@ -55,6 +57,21 @@ func fetchURL(url string, wg *sync.WaitGroup, ch chan<- Result, sem chan struct{
 }
 
 func main() {
+
+	cfg := config.LoadConfig()
+
+	client, err := pkg.ConnectToMongoDB(cfg.MongoURI)
+	
+	if err != nil {
+		log.Fatal("Failed to connect to MongoDB:", err)
+	}
+	
+	defer func() {
+		if err = client.Disconnect(context.TODO()); err != nil {
+			log.Fatal("Error disconnecting from MongoDB:", err)
+		}
+	}()
+
 	urls := []string{"https://example.com", "https://example.org"}
 
 	var wg sync.WaitGroup
