@@ -1,5 +1,4 @@
 
-
 - [x] scrape a few sites 
 - [x] use go routines and sophmore to speed up the scraping process
 - [] set up a database and store the scraped data
@@ -11,6 +10,7 @@
 [text](https://dev.to/jones_charles_ad50858dbc0/building-a-high-concurrency-web-crawler-in-go-a-practical-guide-i3a)
 [text](https://medium.com/@tonywangcn/web-crawling-at-scale-navigating-billions-of-urls-with-efficiency-7a9b9a1e3829)
 [text](https://github.com/tonywangcn/distributed-web-crawler/blob/master/go/src/crawler/crawler.go)
+[text](https://github.com/gocolly/colly)
 
 - [] set up api for searching the scraped data
 
