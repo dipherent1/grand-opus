@@ -14,6 +14,7 @@ func main() {
 	cfg := config.LoadConfig()
 
 	client, err := pkg.ConnectToMongoDB(cfg.MongoURI)
+	db := client.Database(cfg.MongoDB)
 
 	if err != nil {
 		log.Fatal("Failed to connect to MongoDB:", err)
@@ -25,6 +26,6 @@ func main() {
 		}
 	}()
 
-	crawler.Crawl()
+	crawler.Crawl(db)
 
 }

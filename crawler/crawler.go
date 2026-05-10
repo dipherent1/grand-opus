@@ -2,16 +2,18 @@ package crawler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
 	"time"
 
-	"fmt"
-
 	"github.com/PuerkitoBio/goquery"
 	"github.com/dipherent1/grand-opus/internal/domain"
 	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, sem chan struct{}) {
@@ -69,10 +71,24 @@ func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, sem chan
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
+	fmt.Printf("url: %s is stored in the channel \n", url)
 
 }
 
-func Crawl() {
+func CreateIndexes(collection *mongo.Collection) error {
+	IndexModel := mongo.IndexModel{
+		Keys:    bson.D{{Key: "url", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	}
+
+	_, err := collection.Indexes().CreateOne(context.Background(), IndexModel)
+	if err != nil {
+		log.Printf("Error creating index: %v", err)
+	}
+	return err
+}
+
+func Crawl(client *mongo.Database) {
 
 	urls := []string{"https://example.com", "https://example.org", "https://github.com/tonywangcn/distributed-web-crawler/blob/master/go/src/crawler/crawler.go"}
 
@@ -84,13 +100,25 @@ func Crawl() {
 	for _, url := range urls {
 		wg.Add(1)
 		go FetchURL(url, &wg, ch, sem)
+		fmt.Printf("sent url: %s through goroutine \n", url)
 	}
 
 	wg.Wait()
 	close(ch)
 
-	for result := range ch {
-		fmt.Printf("URL: %s\n", result.URL)
+	urlCollection := client.Collection("urls")
+
+	err := CreateIndexes(urlCollection)
+	if err != nil {
+		log.Printf("Error creating indexes: %v", err)
 	}
 
+	for result := range ch {
+		_, err := urlCollection.InsertOne(context.Background(), result)
+		if err != nil {
+			log.Printf("Error inserting result into MongoDB: %v", err)
+		} else {
+			fmt.Printf("url: %s is stored in the database \n", result.URL)
+		}
+	}
 }

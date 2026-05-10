@@ -3,9 +3,9 @@ package domain
 import "time"
 
 type Content struct {
-	Id            string    `bson:"_id,omitempty" json:"_id,omitempty"`
+	Id            string    `bson:"_id" json:"_id" unique:"true"`
 	Domain        string    `bson:"domain" json:"domain"`
-	URL           string    `bson:"url" json:"url"`
+	URL           string    `bson:"url" json:"url" unique:"true"`
 	Title         string    `bson:"title" json:"title"`
 	Desc          string    `bson:"desc" json:"desc"`
 	Author        string    `bson:"author" json:"author"`
