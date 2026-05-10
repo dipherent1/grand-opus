@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	neturl "net/url"
+
 	"github.com/PuerkitoBio/goquery"
 	"github.com/dipherent1/grand-opus/internal/domain"
 	"github.com/google/uuid"
@@ -16,7 +18,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, sem chan struct{}) {
+func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, urlQueue chan<- string, sem chan struct{}, visited *sync.Map) {
 
 	defer wg.Done()
 
@@ -47,6 +49,31 @@ func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, sem chan
 		log.Printf("Error fetching the doc; err: %s", err)
 		return
 	}
+
+	baseURL, err := neturl.Parse(url)
+	if err != nil {
+		log.Printf("Error parsing the URL: %v", err)
+		return
+	}
+
+	doc.Find("a").Each(func(i int, s *goquery.Selection) {
+		href, exists := s.Attr("href")
+		if !exists {
+			return
+		}
+		parsedHref, err := neturl.Parse(href)
+		if err != nil {
+			return
+		}
+
+		absURL := baseURL.ResolveReference(parsedHref)
+		
+		if _, loaded := visited.LoadOrStore(absURL.String(), true); !loaded {
+			fmt.Printf("Found new link: %s \n", absURL.String())
+			wg.Add(1)
+			urlQueue <- absURL.String()
+		}
+	})
 
 	html, err := doc.Html()
 	if err != nil {
@@ -96,29 +123,39 @@ func Crawl(client *mongo.Database) {
 
 	ch := make(chan domain.Content, len(urls))
 	sem := make(chan struct{}, 5) // Limit to 5 concurrent fetches
+	visited := sync.Map{}
+
+	urlQueue := make(chan string, 100) // Buffer size for URL queue
 
 	for _, url := range urls {
 		wg.Add(1)
-		go FetchURL(url, &wg, ch, sem)
+		urlQueue <- url
+	}
+
+	go func() {
+		wg.Wait()
+		close(urlQueue)
+		close(ch)
+	}()
+
+	for url := range urlQueue {
 		fmt.Printf("sent url: %s through goroutine \n", url)
+		go FetchURL(url, &wg, ch, urlQueue, sem, &visited)
 	}
 
-	wg.Wait()
-	close(ch)
+	// urlCollection := client.Collection("urls")
 
-	urlCollection := client.Collection("urls")
+	// err := CreateIndexes(urlCollection)
+	// if err != nil {
+	// 	log.Printf("Error creating indexes: %v", err)
+	// }
 
-	err := CreateIndexes(urlCollection)
-	if err != nil {
-		log.Printf("Error creating indexes: %v", err)
-	}
-
-	for result := range ch {
-		_, err := urlCollection.InsertOne(context.Background(), result)
-		if err != nil {
-			log.Printf("Error inserting result into MongoDB: %v", err)
-		} else {
-			fmt.Printf("url: %s is stored in the database \n", result.URL)
-		}
-	}
+	// for result := range ch {
+	// 	_, err := urlCollection.InsertOne(context.Background(), result)
+	// 	if err != nil {
+	// 		log.Printf("Error inserting result into MongoDB: %v", err)
+	// 	} else {
+	// 		fmt.Printf("url: %s is stored in the database \n", result.URL)
+	// 	}
+	// }
 }
