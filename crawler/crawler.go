@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	neturl "net/url"
@@ -18,7 +19,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, urlQueue chan<- string, sem chan struct{}, visited *sync.Map) {
+func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, urlQueue chan<- string, sem chan struct{}, visited *sync.Map, pageCount *atomic.Int64, maxPages int64) {
 
 	defer wg.Done()
 
@@ -57,21 +58,33 @@ func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, urlQueue
 	}
 
 	doc.Find("a").Each(func(i int, s *goquery.Selection) {
+
+		if pageCount.Load() >= maxPages {
+			return
+		}
+
 		href, exists := s.Attr("href")
 		if !exists {
 			return
 		}
+
 		parsedHref, err := neturl.Parse(href)
 		if err != nil {
 			return
 		}
 
 		absURL := baseURL.ResolveReference(parsedHref)
-		
+
 		if _, loaded := visited.LoadOrStore(absURL.String(), true); !loaded {
 			fmt.Printf("Found new link: %s \n", absURL.String())
-			wg.Add(1)
-			urlQueue <- absURL.String()
+			if pageCount.Add(1) <= maxPages {
+				// This block is the "safe zone"
+				wg.Add(1)
+				urlQueue <- absURL.String()
+			} else {
+				// We lost the race, so we undo our increment
+				pageCount.Add(-1)
+			}
 		}
 	})
 
@@ -117,19 +130,30 @@ func CreateIndexes(collection *mongo.Collection) error {
 
 func Crawl(client *mongo.Database) {
 
-	urls := []string{"https://example.com", "https://example.org", "https://github.com/tonywangcn/distributed-web-crawler/blob/master/go/src/crawler/crawler.go"}
+	seedURLs := []string{"https://example.com", "https://example.org", "https://github.com/tonywangcn/distributed-web-crawler/blob/master/go/src/crawler/crawler.go"}
+
+	const (
+		MaxConcurrentFetches = 5
+		MaxPages             = 1000
+	)
+
+	var pageCount atomic.Int64
 
 	var wg sync.WaitGroup
 
-	ch := make(chan domain.Content, len(urls))
-	sem := make(chan struct{}, 5) // Limit to 5 concurrent fetches
-	visited := sync.Map{}
-
+	ch := make(chan domain.Content, 3)
+	sem := make(chan struct{}, 5)      // Limit to 5 concurrent fetches
 	urlQueue := make(chan string, 100) // Buffer size for URL queue
 
-	for _, url := range urls {
-		wg.Add(1)
-		urlQueue <- url
+	visited := sync.Map{}
+
+	for _, url := range seedURLs {
+		if _, loaded := visited.LoadOrStore(url, true); !loaded {
+			if pageCount.Add(1) <= MaxPages {
+				wg.Add(1)
+				urlQueue <- url
+			}
+		}
 	}
 
 	go func() {
@@ -138,10 +162,12 @@ func Crawl(client *mongo.Database) {
 		close(ch)
 	}()
 
-	for url := range urlQueue {
-		fmt.Printf("sent url: %s through goroutine \n", url)
-		go FetchURL(url, &wg, ch, urlQueue, sem, &visited)
-	}
+	go func() {
+		for url := range urlQueue {
+			fmt.Printf("sent url: %s through goroutine \n", url)
+			go FetchURL(url, &wg, ch, urlQueue, sem, &visited, &pageCount, MaxPages)
+		}
+	}()
 
 	// urlCollection := client.Collection("urls")
 
@@ -150,7 +176,9 @@ func Crawl(client *mongo.Database) {
 	// 	log.Printf("Error creating indexes: %v", err)
 	// }
 
-	// for result := range ch {
+	for result := range ch {
+		fmt.Printf("Received content for URL: %s \n", result.URL)
+	}
 	// 	_, err := urlCollection.InsertOne(context.Background(), result)
 	// 	if err != nil {
 	// 		log.Printf("Error inserting result into MongoDB: %v", err)
@@ -158,4 +186,6 @@ func Crawl(client *mongo.Database) {
 	// 		fmt.Printf("url: %s is stored in the database \n", result.URL)
 	// 	}
 	// }
+
+	fmt.Printf("finished executing page count: %d \n", pageCount.Load())
 }
