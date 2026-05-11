@@ -3,5 +3,5 @@ crawler:
     - "https://example.com"
     - "https://go.dev"
   max_pages: 1000
-  concurrency: 10
+  max_concurrent_fetches: 10
   request_timeout_seconds: 30

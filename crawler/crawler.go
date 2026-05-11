@@ -12,6 +12,7 @@ import (
 	neturl "net/url"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/dipherent1/grand-opus/config"
 	"github.com/dipherent1/grand-opus/internal/domain"
 	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -19,12 +20,28 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, urlQueue chan<- string, sem chan struct{}, visited *sync.Map, pageCount *atomic.Int64, maxPages int64) {
+type CrawlerConfig struct {
+	MaxPages            int64
+	MaxConcurrentFetches int
 
-	defer wg.Done()
+	// Dependencies
+	DB *mongo.Database // Use a more descriptive name than 'client'
 
-	sem <- struct{}{}        // Acquire semaphore
-	defer func() { <-sem }() // Release semaphore
+	// Internal State
+	wg        *sync.WaitGroup
+	pageCount *atomic.Int64
+	visited   *sync.Map
+	urlQueue  chan string
+	resultsCh chan domain.Content
+	sem       chan struct{}
+}
+
+func FetchURL(params CrawlerConfig, url string) {
+
+	defer params.wg.Done()
+
+	params.sem <- struct{}{}        // Acquire semaphore
+	defer func() { <-params.sem }() // Release semaphore
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
@@ -59,7 +76,7 @@ func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, urlQueue
 
 	doc.Find("a").Each(func(i int, s *goquery.Selection) {
 
-		if pageCount.Load() >= maxPages {
+		if params.pageCount.Load() >= params.MaxPages {
 			return
 		}
 
@@ -75,15 +92,15 @@ func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, urlQueue
 
 		absURL := baseURL.ResolveReference(parsedHref)
 
-		if _, loaded := visited.LoadOrStore(absURL.String(), true); !loaded {
+		if _, loaded := params.visited.LoadOrStore(absURL.String(), true); !loaded {
 			fmt.Printf("Found new link: %s \n", absURL.String())
-			if pageCount.Add(1) <= maxPages {
+			if params.pageCount.Add(1) <= params.MaxPages {
 				// This block is the "safe zone"
-				wg.Add(1)
-				urlQueue <- absURL.String()
+				params.wg.Add(1)
+				params.urlQueue <- absURL.String()
 			} else {
 				// We lost the race, so we undo our increment
-				pageCount.Add(-1)
+				params.pageCount.Add(-1)
 			}
 		}
 	})
@@ -100,7 +117,7 @@ func FetchURL(url string, wg *sync.WaitGroup, ch chan<- domain.Content, urlQueue
 
 	textContent := doc.Find("body").Text()
 
-	ch <- domain.Content{
+	params.resultsCh <- domain.Content{
 		Id:        uuid.New().String(),
 		URL:       url,
 		Title:     doc.Find("title").Text(),
@@ -130,30 +147,37 @@ func CreateIndexes(collection *mongo.Collection) error {
 
 func Crawl(client *mongo.Database) {
 
-	seedURLs := []string{"https://example.com", "https://example.org", "https://github.com/tonywangcn/distributed-web-crawler/blob/master/go/src/crawler/crawler.go"}
-
-	const (
-		MaxConcurrentFetches = 5
-		MaxPages             = 1000
-	)
+	cfg := config.LoadConfig()
 
 	var pageCount atomic.Int64
 
 	var wg sync.WaitGroup
 
 	ch := make(chan domain.Content, 3)
-	sem := make(chan struct{}, 5)      // Limit to 5 concurrent fetches
+	sem := make(chan struct{}, cfg.MaxConcurrentFetches)      // Limit to 5 concurrent fetches
 	urlQueue := make(chan string, 100) // Buffer size for URL queue
 
 	visited := sync.Map{}
 
-	for _, url := range seedURLs {
+	for _, url := range cfg.SeedUrls {
 		if _, loaded := visited.LoadOrStore(url, true); !loaded {
-			if pageCount.Add(1) <= MaxPages {
+			if pageCount.Add(1) <= int64(cfg.MaxPages) {
 				wg.Add(1)
 				urlQueue <- url
 			}
 		}
+	}
+
+	params := CrawlerConfig{
+		MaxPages:             cfg.MaxPages,
+		MaxConcurrentFetches: cfg.MaxConcurrentFetches,
+		DB:                   client,
+		wg:                   &wg,
+		pageCount:            &pageCount,
+		visited:              &visited,
+		urlQueue:             urlQueue,
+		resultsCh:            ch,
+		sem:                  sem,
 	}
 
 	go func() {
@@ -165,7 +189,7 @@ func Crawl(client *mongo.Database) {
 	go func() {
 		for url := range urlQueue {
 			fmt.Printf("sent url: %s through goroutine \n", url)
-			go FetchURL(url, &wg, ch, urlQueue, sem, &visited, &pageCount, MaxPages)
+			go FetchURL(params, url)
 		}
 	}()
 
