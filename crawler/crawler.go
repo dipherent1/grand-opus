@@ -2,8 +2,8 @@ package crawler
 
 import (
 	"context"
-	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -15,17 +15,40 @@ import (
 	"github.com/dipherent1/grand-opus/config"
 	"github.com/dipherent1/grand-opus/internal/domain"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
+var (
+	metricsPagesCrawled = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "crawler_pages_crawled_total",
+		Help: "The total number of successfully crawled pages",
+	})
+	metricsCrawlErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "crawler_errors_total",
+		Help: "The total number of errors encountered, partitioned by type",
+	}, []string{"error_type"}) // e.g., "http_fetch", "parse_html", "db_insert"
+	metricsActiveWorkers = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "crawler_active_workers",
+		Help: "The current number of concurrent fetch routines running",
+	})
+	metricsQueueSize = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "crawler_url_queue_size",
+		Help: "The current number of URLs waiting to be fetched",
+	})
+)
+
 type CrawlerConfig struct {
-	MaxPages            int64
+	MaxPages             int64
 	MaxConcurrentFetches int
+	SeedUrls             []string
 
 	// Dependencies
-	DB *mongo.Database // Use a more descriptive name than 'client'
+	DB     *mongo.Database // Use a more descriptive name than 'client'
+	Logger *slog.Logger
 
 	// Internal State
 	wg        *sync.WaitGroup
@@ -36,12 +59,33 @@ type CrawlerConfig struct {
 	sem       chan struct{}
 }
 
-func FetchURL(params CrawlerConfig, url string) {
+func NewCrawler(db *mongo.Database, cfg *config.Config, logger *slog.Logger) *CrawlerConfig {
+	return &CrawlerConfig{
+		MaxPages:             cfg.MaxPages,
+		MaxConcurrentFetches: cfg.MaxConcurrentFetches,
+		SeedUrls:             cfg.SeedUrls,
+		DB:                   db,
+		Logger:               logger,
+		wg:                   &sync.WaitGroup{},
+		pageCount:            &atomic.Int64{},
+		visited:              &sync.Map{},
+		urlQueue:             make(chan string, 100),
+		resultsCh:            make(chan domain.Content, 3),
+		sem:                  make(chan struct{}, cfg.MaxConcurrentFetches),
+	}
+}
 
-	defer params.wg.Done()
+func (c *CrawlerConfig) FetchURL(url string) {
 
-	params.sem <- struct{}{}        // Acquire semaphore
-	defer func() { <-params.sem }() // Release semaphore
+	defer c.wg.Done()
+
+	c.sem <- struct{}{}
+	metricsActiveWorkers.Inc()
+	// Acquire semaphore
+	defer func() {
+		<-c.sem
+		metricsActiveWorkers.Dec()
+	}() // Release semaphore
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
@@ -49,13 +93,17 @@ func FetchURL(params CrawlerConfig, url string) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 
 	if err != nil {
-		log.Printf("Error fetching the resp, err: %s", err)
+		c.Logger.Error("Error fetching the resp", "error", err)
+
+		metricsCrawlErrors.WithLabelValues("request_creation").Inc()
+
 		return
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("Error fetching the URL: %v", err)
+		c.Logger.Error("Error fetching the URL", "error", err)
+		metricsCrawlErrors.WithLabelValues("http_fetch").Inc()
 		return // MUST return here so you don't use a nil 'resp'
 	}
 
@@ -64,60 +112,67 @@ func FetchURL(params CrawlerConfig, url string) {
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 
 	if err != nil {
-		log.Printf("Error fetching the doc; err: %s", err)
+		c.Logger.Error("Error fetching the doc", "error", err)
+		metricsCrawlErrors.WithLabelValues("parse_html").Inc()
 		return
 	}
 
 	baseURL, err := neturl.Parse(url)
 	if err != nil {
-		log.Printf("Error parsing the URL: %v", err)
+		c.Logger.Error("Error parsing the URL", "error", err)
 		return
 	}
 
 	doc.Find("a").Each(func(i int, s *goquery.Selection) {
 
-		if params.pageCount.Load() >= params.MaxPages {
+		if c.pageCount.Load() >= c.MaxPages {
 			return
 		}
 
 		href, exists := s.Attr("href")
 		if !exists {
+			c.Logger.Error("Error fetching the href", "error", err)
 			return
 		}
 
 		parsedHref, err := neturl.Parse(href)
 		if err != nil {
+			c.Logger.Error("Error parsing the href", "error", err)
 			return
 		}
 
 		absURL := baseURL.ResolveReference(parsedHref)
+		absURL.Fragment = ""
+		cleanURL := absURL.String()
 
-		if _, loaded := params.visited.LoadOrStore(absURL.String(), true); !loaded {
-			fmt.Printf("Found new link: %s \n", absURL.String())
-			if params.pageCount.Add(1) <= params.MaxPages {
-				// This block is the "safe zone"
-				params.wg.Add(1)
-				params.urlQueue <- absURL.String()
+		if _, loaded := c.visited.LoadOrStore(absURL.String(), true); !loaded {
+			c.Logger.Info("Found new link", "url", absURL.String())
+			if c.pageCount.Add(1) <= c.MaxPages {
+				c.Logger.Debug("Discovered new link", "parent_url", url, "new_url", cleanURL)
+				c.wg.Add(1)
+				c.urlQueue <- absURL.String()
+				metricsQueueSize.Inc() // Metric: Queue grew
+
 			} else {
 				// We lost the race, so we undo our increment
-				params.pageCount.Add(-1)
+				c.pageCount.Add(-1)
 			}
 		}
 	})
 
 	html, err := doc.Html()
 	if err != nil {
-		log.Printf("Error fetching the html content; err: %s", err)
+		c.Logger.Error("Error fetching the html content", "error", err)
 	}
 
 	bodyContent, err := doc.Find("body").Html()
 	if err != nil {
-		log.Printf("Error finding body html content; err: %s", err)
+		c.Logger.Error("Error finding body html content", "error", err)
 	}
 
 	textContent := doc.Find("body").Text()
 
-	params.resultsCh <- domain.Content{
+	c.resultsCh <- domain.Content{
 		Id:        uuid.New().String(),
 		URL:       url,
 		Title:     doc.Find("title").Text(),
@@ -128,7 +183,8 @@ func FetchURL(params CrawlerConfig, url string) {
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
-	fmt.Printf("url: %s is stored in the channel \n", url)
+	metricsPagesCrawled.Inc() // Metric: Success!
+	c.Logger.Info("Content fetched", "url", url)
 
 }
 
@@ -140,56 +196,37 @@ func CreateIndexes(collection *mongo.Collection) error {
 
 	_, err := collection.Indexes().CreateOne(context.Background(), IndexModel)
 	if err != nil {
-		log.Printf("Error creating index: %v", err)
+		log.Fatal("Error creating index", "error", err)
 	}
 	return err
 }
 
-func Crawl(client *mongo.Database) {
-
-	cfg := config.LoadConfig()
-
-	var pageCount atomic.Int64
-
-	var wg sync.WaitGroup
-
-	ch := make(chan domain.Content, 3)
-	sem := make(chan struct{}, cfg.MaxConcurrentFetches)      // Limit to 5 concurrent fetches
-	urlQueue := make(chan string, 100) // Buffer size for URL queue
+func (c *CrawlerConfig) Crawl() {
 
 	visited := sync.Map{}
 
-	for _, url := range cfg.SeedUrls {
+	for _, url := range c.SeedUrls {
 		if _, loaded := visited.LoadOrStore(url, true); !loaded {
-			if pageCount.Add(1) <= int64(cfg.MaxPages) {
-				wg.Add(1)
-				urlQueue <- url
+			if c.pageCount.Add(1) <= int64(c.MaxPages) {
+				c.wg.Add(1)
+				c.urlQueue <- url
+				metricsQueueSize.Inc()
+
 			}
 		}
 	}
 
-	params := CrawlerConfig{
-		MaxPages:             cfg.MaxPages,
-		MaxConcurrentFetches: cfg.MaxConcurrentFetches,
-		DB:                   client,
-		wg:                   &wg,
-		pageCount:            &pageCount,
-		visited:              &visited,
-		urlQueue:             urlQueue,
-		resultsCh:            ch,
-		sem:                  sem,
-	}
-
 	go func() {
-		wg.Wait()
-		close(urlQueue)
-		close(ch)
+		c.wg.Wait()
+		close(c.urlQueue)
+		close(c.resultsCh)
 	}()
 
 	go func() {
-		for url := range urlQueue {
-			fmt.Printf("sent url: %s through goroutine \n", url)
-			go FetchURL(params, url)
+		for url := range c.urlQueue {
+			c.Logger.Info("Sending URL for crawling", "url", url)
+			metricsQueueSize.Dec() // Metric: Removed from queue
+			go c.FetchURL(url)
 		}
 	}()
 
@@ -197,19 +234,20 @@ func Crawl(client *mongo.Database) {
 
 	// err := CreateIndexes(urlCollection)
 	// if err != nil {
-	// 	log.Printf("Error creating indexes: %v", err)
+	// 	c.Logger.Error("Error creating indexes", "error", err)
 	// }
 
-	for result := range ch {
-		fmt.Printf("Received content for URL: %s \n", result.URL)
+	for result := range c.resultsCh {
+		c.Logger.Info("Received content for URL", "url", result.URL)
 	}
 	// 	_, err := urlCollection.InsertOne(context.Background(), result)
 	// 	if err != nil {
-	// 		log.Printf("Error inserting result into MongoDB: %v", err)
+	// 		c.Logger.Error("Error inserting result into MongoDB", "error", err)
 	// 	} else {
-	// 		fmt.Printf("url: %s is stored in the database \n", result.URL)
+	// 		c.Logger.Info("Content inserted into MongoDB", "url", result.URL)
+	// 	}
 	// 	}
 	// }
 
-	fmt.Printf("finished executing page count: %d \n", pageCount.Load())
+	c.Logger.Info("Finished executing", "page_count", c.pageCount.Load())
 }

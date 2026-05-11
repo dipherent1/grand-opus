@@ -14,6 +14,10 @@ func ConnectToMongoDB(MongoURI string) (*mongo.Client, error) {
 	// Defines the options for the MongoDB client
 	opts := options.Client().ApplyURI(MongoURI).SetServerAPIOptions(serverAPI)
 	// Creates a new client and connects to the server
+
+	// ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// defer cancel()
+
 	client, err := mongo.Connect(opts)
 	if err != nil {
 		return nil, err
