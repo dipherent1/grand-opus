@@ -2,6 +2,6 @@ crawler:
   seed_urls:
     - "https://example.com"
     - "https://go.dev"
-  max_pages: 1000
-  max_concurrent_fetches: 10
+  max_pages: 10000
+  max_concurrent_fetches: 50
   request_timeout_seconds: 30

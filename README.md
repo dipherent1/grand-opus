@@ -4,7 +4,7 @@
 - [x] set up a database and store the scraped data
 - [x] crawl the web 
 
-- [] set up logging and monitoring for the scraper
+- [x] set up logging and monitoring for the scraper
 
 - [] set up redis to store the scraped data and use it as a cache for the scraped data
 [text](https://dev.to/jones_charles_ad50858dbc0/building-a-high-concurrency-web-crawler-in-go-a-practical-guide-i3a)

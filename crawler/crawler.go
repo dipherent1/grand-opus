@@ -23,23 +23,46 @@ import (
 )
 
 var (
-	metricsPagesCrawled = promauto.NewCounter(prometheus.CounterOpts{
+	metricsPagesCrawled = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "crawler_pages_crawled_total",
 		Help: "The total number of successfully crawled pages",
-	})
+	}, []string{"domain"})
+
 	metricsCrawlErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "crawler_errors_total",
 		Help: "The total number of errors encountered, partitioned by type",
 	}, []string{"error_type"}) // e.g., "http_fetch", "parse_html", "db_insert"
+
 	metricsActiveWorkers = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "crawler_active_workers",
 		Help: "The current number of concurrent fetch routines running",
 	})
+
 	metricsQueueSize = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "crawler_url_queue_size",
 		Help: "The current number of URLs waiting to be fetched",
 	})
+
+	metricsHttpRequestDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "crawler_http_request_duration_seconds",
+		Help:    "The duration of HTTP requests to fetch URLs",
+		Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+	})
+
+	metricsDbInsertDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "crawler_db_insert_duration_seconds",
+		Help:    "The duration of database insert operations",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5},
+	})
 )
+
+func getDomain(rawURL string) string {
+	parsedURL, err := neturl.Parse(rawURL)
+	if err != nil {
+		return "unknown"
+	}
+	return parsedURL.Hostname()
+}
 
 type CrawlerConfig struct {
 	MaxPages             int64
@@ -70,13 +93,18 @@ func NewCrawler(db *mongo.Database, cfg *config.Config, logger *slog.Logger) *Cr
 		pageCount:            &atomic.Int64{},
 		visited:              &sync.Map{},
 		urlQueue:             make(chan string, 100),
-		resultsCh:            make(chan domain.Content, 3),
+		resultsCh:            make(chan domain.Content, 100),
 		sem:                  make(chan struct{}, cfg.MaxConcurrentFetches),
 	}
 }
 
 func (c *CrawlerConfig) FetchURL(url string) {
 
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start).Seconds()
+		metricsHttpRequestDuration.Observe(duration)
+	}()
 	defer c.wg.Done()
 
 	c.sem <- struct{}{}
@@ -183,7 +211,8 @@ func (c *CrawlerConfig) FetchURL(url string) {
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
-	metricsPagesCrawled.Inc() // Metric: Success!
+	domain := getDomain(url)
+	metricsPagesCrawled.WithLabelValues(domain).Inc()
 	c.Logger.Info("Content fetched", "url", url)
 
 }
@@ -203,10 +232,9 @@ func CreateIndexes(collection *mongo.Collection) error {
 
 func (c *CrawlerConfig) Crawl() {
 
-	visited := sync.Map{}
 
 	for _, url := range c.SeedUrls {
-		if _, loaded := visited.LoadOrStore(url, true); !loaded {
+		if _, loaded := c.visited.LoadOrStore(url, true); !loaded {
 			if c.pageCount.Add(1) <= int64(c.MaxPages) {
 				c.wg.Add(1)
 				c.urlQueue <- url
@@ -239,15 +267,22 @@ func (c *CrawlerConfig) Crawl() {
 
 	for result := range c.resultsCh {
 		c.Logger.Info("Received content for URL", "url", result.URL)
+
+		dbStart := time.Now()
+
+		// Record the duration it took
+		dbDuration := time.Since(dbStart).Seconds()
+		metricsDbInsertDuration.Observe(dbDuration)
+
+		// }
+		// 	_, err := urlCollection.InsertOne(context.Background(), result)
+		// 	if err != nil {
+		// 		c.Logger.Error("Error inserting result into MongoDB", "error", err)
+		// 	} else {
+		// 		c.Logger.Info("Content inserted into MongoDB", "url", result.URL)
+		// 	}
+		// 	}
 	}
-	// 	_, err := urlCollection.InsertOne(context.Background(), result)
-	// 	if err != nil {
-	// 		c.Logger.Error("Error inserting result into MongoDB", "error", err)
-	// 	} else {
-	// 		c.Logger.Info("Content inserted into MongoDB", "url", result.URL)
-	// 	}
-	// 	}
-	// }
 
 	c.Logger.Info("Finished executing", "page_count", c.pageCount.Load())
 }

@@ -45,11 +45,11 @@ func main() {
 		}
 	}()
 	appCrawler := crawler.NewCrawler(db, cfg, logger)
-	// go func() {
-	// 	logger.Info("Crawler started in the background.")
-	// 	logger.Info("Crawler has finished its work.")
-	// }()
-	appCrawler.Crawl() // This will now run concurrently
+	go func() {
+		logger.Info("Crawler started in the background.")
+		appCrawler.Crawl() // This will now run concurrently
+		logger.Info("Crawler has finished its work.")
+	}()
 
 	// Create a channel to listen for OS signals.
 	shutdown := make(chan os.Signal, 1)
